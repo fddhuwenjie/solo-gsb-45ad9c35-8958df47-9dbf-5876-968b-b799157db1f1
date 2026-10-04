@@ -13,6 +13,7 @@ from .models import (
     CapabilityToken,
     ChainSubmission,
     IntegrityReport,
+    RevocationEvent,
 )
 
 SCHEMA = """
@@ -33,6 +34,21 @@ CREATE TABLE IF NOT EXISTS tokens (
     position    INTEGER NOT NULL,
     token_json  TEXT NOT NULL,
     PRIMARY KEY (chain_id, position),
+    FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
+);
+
+-- 撤销事件为只追加（append-only）审计记录：无更新 / 删除路径。
+-- request_key 全局唯一（跨链也不可复用）；同一令牌至多一条有效撤销事件。
+CREATE TABLE IF NOT EXISTS revocations (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain_id       TEXT NOT NULL,
+    token_id       TEXT NOT NULL,
+    effective_at   TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    request_key    TEXT NOT NULL UNIQUE,
+    content_sha256 TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    UNIQUE (chain_id, token_id),
     FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
 );
 """
@@ -170,4 +186,85 @@ def load_chain_record(conn: sqlite3.Connection, chain_id: str) -> dict | None:
         "created_at": datetime.fromisoformat(chain["created_at"]),
         "integrity": IntegrityReport.model_validate(json.loads(chain["report_json"])),
         "tokens": submission.tokens,
+        "revocations": load_revocations(conn, chain_id),
     }
+
+
+# --------------------------------------------------------------------------- #
+# 撤销事件（不可变，只追加）
+# --------------------------------------------------------------------------- #
+def token_exists(conn: sqlite3.Connection, chain_id: str, token_id: str) -> bool:
+    """令牌是否存在于指定链的提交中（按 position 存在性判定，重复 id 也算存在）。"""
+    row = conn.execute(
+        "SELECT 1 FROM tokens WHERE chain_id = ? "
+        "AND json_extract(token_json, '$.token_id') = ? LIMIT 1",
+        (chain_id, token_id),
+    ).fetchone()
+    return row is not None
+
+
+def load_revocation_by_request_key(
+    conn: sqlite3.Connection, request_key: str
+) -> RevocationEvent | None:
+    row = conn.execute(
+        "SELECT chain_id, token_id, effective_at, reason, request_key, "
+        "content_sha256, created_at FROM revocations WHERE request_key = ?",
+        (request_key,),
+    ).fetchone()
+    return _revocation_from_row(row) if row else None
+
+
+def load_revocation_for_token(
+    conn: sqlite3.Connection, chain_id: str, token_id: str
+) -> RevocationEvent | None:
+    row = conn.execute(
+        "SELECT chain_id, token_id, effective_at, reason, request_key, "
+        "content_sha256, created_at FROM revocations "
+        "WHERE chain_id = ? AND token_id = ?",
+        (chain_id, token_id),
+    ).fetchone()
+    return _revocation_from_row(row) if row else None
+
+
+def load_revocations(
+    conn: sqlite3.Connection, chain_id: str
+) -> list[RevocationEvent]:
+    """按追加顺序（id 升序）返回某条链的全部撤销事件。"""
+    rows = conn.execute(
+        "SELECT chain_id, token_id, effective_at, reason, request_key, "
+        "content_sha256, created_at FROM revocations WHERE chain_id = ? ORDER BY id",
+        (chain_id,),
+    ).fetchall()
+    return [_revocation_from_row(r) for r in rows]
+
+
+def insert_revocation(
+    conn: sqlite3.Connection,
+    event: RevocationEvent,
+) -> None:
+    """追加一条撤销事件；唯一约束冲突时抛出 sqlite3.IntegrityError（事务回滚）。"""
+    conn.execute(
+        "INSERT INTO revocations (chain_id, token_id, effective_at, reason, "
+        "request_key, content_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            event.chain_id,
+            event.token_id,
+            event.effective_at.astimezone(timezone.utc).isoformat(),
+            event.reason,
+            event.request_key,
+            event.content_sha256,
+            event.created_at.astimezone(timezone.utc).isoformat(),
+        ),
+    )
+
+
+def _revocation_from_row(row: sqlite3.Row) -> RevocationEvent:
+    return RevocationEvent(
+        chain_id=row["chain_id"],
+        token_id=row["token_id"],
+        effective_at=datetime.fromisoformat(row["effective_at"]),
+        reason=row["reason"],
+        request_key=row["request_key"],
+        content_sha256=row["content_sha256"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )

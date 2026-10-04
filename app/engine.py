@@ -1,7 +1,8 @@
 """能力链验证引擎：结构完整性、HMAC 验签、逐级收窄与请求级判定。"""
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
+from datetime import datetime
 from typing import Callable
 
 from .config import settings
@@ -13,6 +14,7 @@ from .models import (
     EvaluateResult,
     IntegrityReport,
     NodeTrace,
+    RevocationEvent,
 )
 from .security import (
     ip_in_network,
@@ -351,10 +353,102 @@ def _first_failure(traces: list[NodeTrace]) -> tuple[str | None, str | None]:
     return None, None
 
 
+# --------------------------------------------------------------------------- #
+# 撤销：按求值时间解释事件，计算受影响节点
+# --------------------------------------------------------------------------- #
+def compute_revocation_effects(
+    submission: ChainSubmission,
+    trace_order: list[str],
+    revocations: list[RevocationEvent] | None,
+    at: datetime,
+) -> dict[str, RevocationEvent]:
+    """返回 ``{token_id: 使其拒绝的撤销事件}``。
+
+    事件按 ``at``（请求时间）解释：仅当 ``at >= effective_at`` 时事件生效；
+    生效事件撤销其目标节点及全部后代。一个节点可能同时被自身事件与祖先事件
+    命中——取轨迹中最靠近根（最先受影响）的事件。
+    """
+    if not revocations:
+        return {}
+
+    # 提交中出现的全部唯一 id 及“父 -> 子”邻接表（按提交位置稳定排序）
+    all_ids: list[str] = []
+    for t in submission.tokens:
+        if t.token_id not in all_ids:
+            all_ids.append(t.token_id)
+    all_id_set = set(all_ids)
+    children_map: dict[str, list[str]] = defaultdict(list)
+    parent_of: dict[str, str | None] = {}
+    for t in submission.tokens:
+        parent_of.setdefault(t.token_id, t.parent_id)
+    for tid in all_ids:
+        pid = parent_of.get(tid)
+        if pid is not None and pid in all_id_set:
+            children_map[pid].append(tid)
+
+    # 仅保留在求值时刻已生效、目标确实在链上的事件
+    active: dict[str, RevocationEvent] = {}
+    for ev in revocations:
+        if at < ev.effective_at:
+            continue  # 生效前的请求仍按原链判定
+        if ev.token_id not in all_ids:
+            continue
+        active.setdefault(ev.token_id, ev)
+
+    # 从每个生效事件目标出发做后代传播（BFS，防止环死循环）
+    origins: dict[str, list[str]] = defaultdict(list)  # token -> 撤销起点
+    for target in active:
+        visited = {target}
+        origins[target].append(target)
+        queue: deque[str] = deque([target])
+        while queue:
+            cur = queue.popleft()
+            for kid in children_map.get(cur, []):
+                if kid not in visited:
+                    visited.add(kid)
+                    origins[kid].append(target)
+                    queue.append(kid)
+
+    trace_index = {tid: i for i, tid in enumerate(trace_order)}
+
+    def _earliest_origin(tid: str) -> str:
+        return min(
+            origins[tid],
+            key=lambda o: trace_index.get(o, len(trace_order)),
+        )
+
+    return {tid: active[_earliest_origin(tid)] for tid in origins}
+
+
+def affected_token_ids(
+    submission: ChainSubmission,
+    trace_order: list[str],
+    event: RevocationEvent,
+) -> list[str]:
+    """撤销目标及其后代，按原链（轨迹顺序；其余按提交顺序）列出。"""
+    effects = compute_revocation_effects(
+        submission, trace_order, [event], event.effective_at
+    )
+    # 去重（提交内可能存在重复 id），保留首次提交位置作为次序
+    first_pos: dict[str, int] = {}
+    for i, t in enumerate(submission.tokens):
+        first_pos.setdefault(t.token_id, i)
+    index = {tid: i for i, tid in enumerate(trace_order)}
+    return sorted(
+        effects.keys(),
+        key=lambda tid: (
+            tid not in index,
+            index.get(tid, 0),
+            first_pos.get(tid, 0),
+        ),
+    )
+
+
 def evaluate_request(
     submission: ChainSubmission,
     request: EvaluateRequest,
     secret_lookup: SecretLookup,
+    revocations: list[RevocationEvent] | None = None,
 ) -> EvaluateResult:
     """对已存能力链执行请求级判定（完整性检查会重新计算一遍）。"""
     integrity, order = validate_chain(submission, secret_lookup)
@@ -371,8 +465,39 @@ def evaluate_request(
         builders[node.token_id].checks = list(node.checks)
 
     at = request.at
+    revoked_by = compute_revocation_effects(
+        submission, [n.token_id for n in integrity.trace], revocations, at
+    )
+
     for t in order:
         b = builders[t.token_id]
+
+        revoker = revoked_by.get(t.token_id)
+        if revoker is not None:
+            is_self = revoker.token_id == t.token_id
+            b.add(
+                Check(
+                    name="revocation_active",
+                    passed=False,
+                    detail=(
+                        f"令牌已于 {revoker.effective_at.isoformat()} 被撤销"
+                        f"（request_key={revoker.request_key}；原因：{revoker.reason}）"
+                        if is_self
+                        else f"祖先令牌 {revoker.token_id} 已于 "
+                        f"{revoker.effective_at.isoformat()} 被撤销，"
+                        "本节点作为其后代同步失效"
+                    ),
+                    reason="revoked",
+                )
+            )
+        else:
+            b.add(
+                Check(
+                    name="revocation_active",
+                    passed=True,
+                    detail="请求时间点没有影响本节点的生效撤销事件",
+                )
+            )
 
         if at < t.not_before:
             b.add(
@@ -447,11 +572,129 @@ def evaluate_request(
         else:
             b.add(Check(name="ip_allowed", passed=True, detail="令牌未限制来源 IP"))
 
+    # 对轨迹中存在但不在根序 ``order`` 内的节点（断链 / 环 / 孤点）补撤销检查，
+    # 并补全其请求级检查，保证轨迹对每个节点都给出完整解释。
+    ordered_ids = {t.token_id for t in order}
+    token_by_id = {}
+    for t in submission.tokens:
+        token_by_id.setdefault(t.token_id, t)
+    for node in integrity.trace:
+        if node.token_id in ordered_ids:
+            continue
+        t = token_by_id[node.token_id]
+        b = builders[t.token_id]
+        revoker = revoked_by.get(t.token_id)
+        if revoker is not None:
+            is_self = revoker.token_id == t.token_id
+            b.add(
+                Check(
+                    name="revocation_active",
+                    passed=False,
+                    detail=(
+                        f"令牌已于 {revoker.effective_at.isoformat()} 被撤销"
+                        f"（request_key={revoker.request_key}；原因：{revoker.reason}）"
+                        if is_self
+                        else f"祖先令牌 {revoker.token_id} 已于 "
+                        f"{revoker.effective_at.isoformat()} 被撤销，"
+                        "本节点作为其后代同步失效"
+                    ),
+                    reason="revoked",
+                )
+            )
+        else:
+            b.add(
+                Check(
+                    name="revocation_active",
+                    passed=True,
+                    detail="请求时间点没有影响本节点的生效撤销事件",
+                )
+            )
+        if at < t.not_before:
+            b.add(
+                Check(
+                    name="time_valid",
+                    passed=False,
+                    detail=f"请求时间 {at.isoformat()} 早于生效时间 {t.not_before.isoformat()}",
+                    reason="before_not_before",
+                )
+            )
+        elif at > t.not_after:
+            b.add(
+                Check(
+                    name="time_valid",
+                    passed=False,
+                    detail=f"请求时间 {at.isoformat()} 晚于失效时间 {t.not_after.isoformat()}",
+                    reason="after_not_after",
+                )
+            )
+        else:
+            b.add(
+                Check(name="time_valid", passed=True, detail="请求时间位于令牌有效期内")
+            )
+        method_ok = request.method in t.methods
+        b.add(
+            Check(
+                name="method_allowed",
+                passed=method_ok,
+                detail=(
+                    f"方法 {request.method} 被允许"
+                    if method_ok
+                    else f"方法 {request.method} 不在 {sorted(t.methods)} 中"
+                ),
+                reason=None if method_ok else "method_not_allowed",
+            )
+        )
+        path_ok = request_path_matches(t.path_pattern, request.request_path)
+        b.add(
+            Check(
+                name="path_covered",
+                passed=path_ok,
+                detail=(
+                    f"{request.request_path} 匹配 {t.path_pattern}"
+                    if path_ok
+                    else f"{request.request_path} 不匹配模式 {t.path_pattern}"
+                ),
+                reason=None if path_ok else "path_not_covered",
+            )
+        )
+        if t.allow_ip is not None:
+            if request.source_ip is None:
+                ip_ok = False
+                detail = f"令牌限定 {t.allow_ip}，但请求未提供 source_ip"
+            else:
+                ip_ok = ip_in_network(request.source_ip, t.allow_ip)
+                detail = (
+                    f"{request.source_ip} 位于 {t.allow_ip}"
+                    if ip_ok
+                    else f"{request.source_ip} 不在 {t.allow_ip} 内"
+                )
+            b.add(
+                Check(
+                    name="ip_allowed",
+                    passed=ip_ok,
+                    detail=detail,
+                    reason=None if ip_ok else "ip_not_allowed",
+                )
+            )
+        else:
+            b.add(Check(name="ip_allowed", passed=True, detail="令牌未限制来源 IP"))
+
     # 重新按完整性轨迹顺序组装
     traces: list[NodeTrace] = []
     for node in integrity.trace:
         traces.append(builders[node.token_id].build())
     first_node, first_reason = _first_failure(traces)
+    first_revoked = next(
+        (
+            node.token_id
+            for node in traces
+            if any(
+                c.name == "revocation_active" and not c.passed
+                for c in node.checks
+            )
+        ),
+        None,
+    )
     decision = "allow" if first_node is None and traces else "deny"
     body_sha = sha256_hex(canonical_json(request.body).encode("utf-8"))
     return EvaluateResult(
@@ -461,4 +704,5 @@ def evaluate_request(
         first_failed_reason=first_reason,
         body_sha256=body_sha,
         trace=traces,
+        first_revoked_node=first_revoked,
     )

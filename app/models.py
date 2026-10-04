@@ -29,6 +29,7 @@ REASONS = {
     "method_not_allowed",
     "path_not_covered",
     "ip_not_allowed",
+    "revoked",
 }
 
 _IPNetwork = IPv4Network | IPv6Network
@@ -214,6 +215,7 @@ class ChainRecord(BaseModel):
     created_at: datetime
     integrity: IntegrityReport
     tokens: list[CapabilityToken]
+    revocations: list["RevocationEvent"] = Field(default_factory=list)
 
 
 class EvaluateResult(BaseModel):
@@ -223,6 +225,44 @@ class EvaluateResult(BaseModel):
     first_failed_reason: str | None
     body_sha256: str
     trace: list[NodeTrace]
+    # 按链顺序第一个因撤销（含祖先撤销的继承）被拒绝的节点
+    first_revoked_node: str | None = None
+
+
+class RevocationRequest(BaseModel):
+    """运维方提交的按时间生效撤销请求（chain_id 取自 URL 路径）。"""
+
+    token_id: str = Field(min_length=1, description="被撤销的令牌 id")
+    effective_at: datetime = Field(description="撤销生效时间（含时区），可指向未来")
+    reason: str = Field(min_length=1, description="撤销原因（审计说明）")
+    request_key: str = Field(
+        min_length=1, description="客户端幂等键；同键内容必须一致"
+    )
+
+    @field_validator("effective_at")
+    @classmethod
+    def _validate_effective_at(cls, v: datetime) -> datetime:
+        return _ensure_aware(v, "effective_at")
+
+
+class RevocationEvent(BaseModel):
+    """不可变撤销事件（追加后不得修改或删除）。"""
+
+    chain_id: str
+    token_id: str
+    effective_at: datetime
+    reason: str
+    request_key: str
+    content_sha256: str = Field(description="事件规范化内容指纹，用于重放/冲突判定")
+    created_at: datetime = Field(description="事件落库时间（UTC）")
+
+
+class RevocationResult(BaseModel):
+    replayed: bool
+    event: RevocationEvent
+    # 被撤销节点自身及其后代，按原链（根→叶）顺序排列
+    affected_token_ids: list[str]
+
 
 
 class PrincipalIn(BaseModel):
@@ -239,3 +279,6 @@ class ConflictDetail(BaseModel):
     chain_id: str
     existing_sha256: str
     received_sha256: str
+
+
+ChainRecord.model_rebuild()

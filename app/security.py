@@ -94,6 +94,24 @@ def canonical_submission_hash(chain_id: str, tokens: list[CapabilityToken]) -> s
     return sha256_hex(canonical_json(payload).encode("utf-8"))
 
 
+def canonical_revocation_hash(
+    chain_id: str,
+    token_id: str,
+    effective_at: datetime,
+    reason: str,
+    request_key: str,
+) -> str:
+    """撤销事件内容指纹：同一 request_key 的重放与换目标冲突均据此判定。"""
+    payload = {
+        "chain_id": chain_id,
+        "token_id": token_id,
+        "effective_at": effective_at,
+        "reason": reason,
+        "request_key": request_key,
+    }
+    return sha256_hex(canonical_json(payload).encode("utf-8"))
+
+
 # --------------------------------------------------------------------------- #
 # 路径 glob
 # --------------------------------------------------------------------------- #

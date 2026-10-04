@@ -29,6 +29,10 @@ SECRETS = {
 }
 
 CHAIN_ID = os.getenv("DEMO_CHAIN_ID", "demo-chain-0001")
+# 演示撤销：撤销 token-a，使其及后代 token-b 自该时刻起失效
+REVOKE_TOKEN_ID = "token-a"
+REVOKE_REQUEST_KEY = os.getenv("DEMO_REVOKE_KEY", "ops-revoke-2026-0001")
+REVOKE_REASON = "运维安全事件：演示撤销 token-a 及其下游委托"
 
 
 def _token(
@@ -99,13 +103,24 @@ def build_submission() -> dict:
     return {"chain_id": CHAIN_ID, "tokens": [root, delegated_a, delegated_b]}
 
 
-def build_evaluation() -> dict:
+def build_evaluation(at: datetime | None = None) -> dict:
     return {
         "request_path": "/files/reports/2026/q1.pdf",
         "method": "GET",
-        "at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "at": (at or datetime.now(timezone.utc)).isoformat().replace("+00:00", "Z"),
         "source_ip": "10.1.2.3",
         "body": {"q": "demo"},
+    }
+
+
+def build_revocation(effective_at: datetime | None = None) -> dict:
+    return {
+        "token_id": REVOKE_TOKEN_ID,
+        "effective_at": (
+            effective_at or datetime.now(timezone.utc)
+        ).isoformat().replace("+00:00", "Z"),
+        "reason": REVOKE_REASON,
+        "request_key": REVOKE_REQUEST_KEY,
     }
 
 
@@ -145,7 +160,38 @@ def main() -> int:
     status_code, body = _post(
         f"{BASE_URL}/api/v1/chains/{CHAIN_ID}/evaluate", build_evaluation()
     )
-    print(f"[evaluate] HTTP {status_code}")
+    print(f"[evaluate-before-revocation] HTTP {status_code}")
+    print(json.dumps(body, ensure_ascii=False, indent=2))
+
+    # 提交按时间生效的撤销（effective_at 取“现在”，立即生效）
+    effective = datetime.now(timezone.utc)
+    status_code, body = _post(
+        f"{BASE_URL}/api/v1/chains/{CHAIN_ID}/revocations",
+        build_revocation(effective),
+    )
+    print(f"[revoke] HTTP {status_code}")
+    print(json.dumps(body, ensure_ascii=False, indent=2))
+
+    # 幂等重放：同 request_key 同内容，应返回 200 + replayed=true
+    status_code, body = _post(
+        f"{BASE_URL}/api/v1/chains/{CHAIN_ID}/revocations",
+        build_revocation(effective),
+    )
+    print(f"[revoke-replay] HTTP {status_code} (replayed={body.get('replayed')})")
+
+    # 生效后的求值：token-a 及其后代 token-b 应被拒绝
+    status_code, body = _post(
+        f"{BASE_URL}/api/v1/chains/{CHAIN_ID}/evaluate", build_evaluation()
+    )
+    print(f"[evaluate-after-revocation] HTTP {status_code}")
+    print(json.dumps(body, ensure_ascii=False, indent=2))
+
+    # 生效前一刻的历史请求：撤销不解释，仍按原链判定
+    before = effective - timedelta(seconds=1)
+    status_code, body = _post(
+        f"{BASE_URL}/api/v1/chains/{CHAIN_ID}/evaluate", build_evaluation(before)
+    )
+    print(f"[evaluate-before-effective-at] HTTP {status_code}")
     print(json.dumps(body, ensure_ascii=False, indent=2))
     return 0
 
