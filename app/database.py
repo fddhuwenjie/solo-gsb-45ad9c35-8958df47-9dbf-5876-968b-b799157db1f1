@@ -13,6 +13,7 @@ from .models import (
     CapabilityToken,
     ChainSubmission,
     IntegrityReport,
+    RevocationEvent,
 )
 
 SCHEMA = """
@@ -33,6 +34,19 @@ CREATE TABLE IF NOT EXISTS tokens (
     position    INTEGER NOT NULL,
     token_json  TEXT NOT NULL,
     PRIMARY KEY (chain_id, position),
+    FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
+);
+
+CREATE TABLE IF NOT EXISTS revocations (
+    chain_id      TEXT NOT NULL,
+    request_key   TEXT NOT NULL,
+    token_id      TEXT NOT NULL,
+    effective_at  TEXT NOT NULL,
+    reason        TEXT NOT NULL,
+    affected_json TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (chain_id, request_key),
+    UNIQUE (chain_id, token_id),
     FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
 );
 """
@@ -140,6 +154,84 @@ def get_chain_hash(conn: sqlite3.Connection, chain_id: str) -> str | None:
     return row["content_sha256"] if row else None
 
 
+# --------------------------------------------------------------------------- #
+# 撤销事件（不可变：只追加，不更新、不删除）
+# --------------------------------------------------------------------------- #
+def save_revocation(
+    conn: sqlite3.Connection,
+    event: RevocationEvent,
+    affected_token_ids: list[str],
+) -> None:
+    """在同一事务中追加一条不可变撤销事件及其受影响令牌快照。"""
+    conn.execute(
+        "INSERT INTO revocations (chain_id, request_key, token_id, effective_at, "
+        "reason, affected_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            event.chain_id,
+            event.request_key,
+            event.token_id,
+            event.effective_at.astimezone(timezone.utc).isoformat(),
+            event.reason,
+            json.dumps(list(affected_token_ids), ensure_ascii=False),
+            event.created_at.astimezone(timezone.utc).isoformat(),
+        ),
+    )
+
+
+def _row_to_revocation(row: sqlite3.Row) -> RevocationEvent:
+    return RevocationEvent(
+        chain_id=row["chain_id"],
+        token_id=row["token_id"],
+        effective_at=datetime.fromisoformat(row["effective_at"]),
+        reason=row["reason"],
+        request_key=row["request_key"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def get_revocation(
+    conn: sqlite3.Connection, chain_id: str, request_key: str
+) -> RevocationEvent | None:
+    row = conn.execute(
+        "SELECT * FROM revocations WHERE chain_id = ? AND request_key = ?",
+        (chain_id, request_key),
+    ).fetchone()
+    return _row_to_revocation(row) if row else None
+
+
+def get_token_revocation(
+    conn: sqlite3.Connection, chain_id: str, token_id: str
+) -> RevocationEvent | None:
+    row = conn.execute(
+        "SELECT * FROM revocations WHERE chain_id = ? AND token_id = ?",
+        (chain_id, token_id),
+    ).fetchone()
+    return _row_to_revocation(row) if row else None
+
+
+def load_revocations(
+    conn: sqlite3.Connection, chain_id: str
+) -> list[RevocationEvent]:
+    """按追加顺序返回链上全部撤销事件。"""
+    rows = conn.execute(
+        "SELECT * FROM revocations WHERE chain_id = ? ORDER BY rowid",
+        (chain_id,),
+    ).fetchall()
+    return [_row_to_revocation(r) for r in rows]
+
+
+def load_affected_token_ids(
+    conn: sqlite3.Connection, chain_id: str, request_key: str
+) -> list[str]:
+    """重放时取回事件落库时计算的受影响令牌（保证返回原结果）。"""
+    row = conn.execute(
+        "SELECT affected_json FROM revocations "
+        "WHERE chain_id = ? AND request_key = ?",
+        (chain_id, request_key),
+    ).fetchone()
+    return json.loads(row["affected_json"]) if row else []
+
+
 def load_submission(conn: sqlite3.Connection, chain_id: str) -> ChainSubmission | None:
     chain = conn.execute(
         "SELECT content_sha256, report_json, created_at FROM chains WHERE chain_id = ?",
@@ -170,4 +262,5 @@ def load_chain_record(conn: sqlite3.Connection, chain_id: str) -> dict | None:
         "created_at": datetime.fromisoformat(chain["created_at"]),
         "integrity": IntegrityReport.model_validate(json.loads(chain["report_json"])),
         "tokens": submission.tokens,
+        "revocations": load_revocations(conn, chain_id),
     }

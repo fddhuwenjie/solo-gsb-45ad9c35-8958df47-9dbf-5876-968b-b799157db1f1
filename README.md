@@ -7,9 +7,11 @@
 2. **签发者检查** —— 根授权必须由配置的根主体签发；委托令牌的 `issuer` 必须等于父令牌的 `subject`；
 3. **结构检查** —— 断链、重复 id、多根、分叉、环、与根不可达；
 4. **逐级收窄** —— 子令牌的路径模式、HTTP 方法集合、时间窗、`allow_ip` CIDR 只能比父令牌更窄；
-5. **请求级判定** —— 给定请求路径、方法、时间、来源 IP 与请求主体，返回 `allow` / `deny`、首个失败节点和完整验证轨迹。
+5. **请求级判定** —— 给定请求路径、方法、时间、来源 IP 与请求主体，返回 `allow` / `deny`、首个失败节点和完整验证轨迹；
+6. **按时间生效的撤销审计** —— 运维方提交不可变撤销事件；求值按请求时间解释事件，被撤销节点及其后代自生效时间起一律拒绝。
 
 相同 `chain_id` 的重放**幂等**（返回 200 + `replayed=true`）；相同 `chain_id` 内容变化返回 **409 Conflict**。
+撤销提交同样幂等：同一 `request_key` 携带相同内容重放返回原结果，携带不同内容返回 **409**。
 
 技术栈：Python · FastAPI · Pydantic v2 · SQLite（标准库 `sqlite3`）· Uvicorn。
 
@@ -158,7 +160,70 @@ PYTHONPATH=. python scripts/demo_chain.py submit
 
 ### `GET /api/v1/chains/{chain_id}`
 
-返回存储的链：令牌列表、内容哈希、创建时间与提交时的完整性报告；不存在返回 `404`。
+返回存储的链：令牌列表、内容哈希、创建时间、提交时的完整性报告，以及按追加顺序排列的
+**撤销事件列表** `revocations`；不存在返回 `404`。
+
+### `POST /api/v1/chains/{chain_id}/revocations`
+
+运维方提交一条**按时间生效的撤销事件**。服务在同一 SQLite 事务中确认令牌存在并追加
+不可变事件（只追加，不更新、不删除），返回事件及按原链顺序（根→叶）列出的受影响令牌
+（被撤销节点及其全部后代）。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/chains/demo-chain-0001/revocations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "token_id": "token-a",
+    "effective_at": "2026-07-01T00:00:00Z",
+    "reason": "service-a 密钥疑似泄露",
+    "request_key": "ops-2026-06-30-001"
+  }'
+```
+
+| 字段           | 必填 | 说明                                             |
+| -------------- | ---- | ------------------------------------------------ |
+| `token_id`     | 是   | 被撤销的令牌 id（必须存在于该链）                |
+| `effective_at` | 是   | 撤销生效时间，**必须携带时区**（如 `...Z`）      |
+| `reason`       | 是   | 撤销原因（审计自由文本）                         |
+| `request_key`  | 是   | 幂等键，同一链内唯一                             |
+
+`201 Created` 响应：
+
+```json
+{
+  "chain_id": "demo-chain-0001",
+  "replayed": false,
+  "event": {
+    "chain_id": "demo-chain-0001",
+    "token_id": "token-a",
+    "effective_at": "2026-07-01T00:00:00Z",
+    "reason": "service-a 密钥疑似泄露",
+    "request_key": "ops-2026-06-30-001",
+    "created_at": "2026-06-30T12:00:00Z"
+  },
+  "affected_token_ids": ["token-a", "token-b"]
+}
+```
+
+幂等与冲突语义：
+
+- **重放**：同一 `request_key` 携带相同内容（`token_id` / `effective_at` / `reason` 一致）
+  返回 `200 OK`、`replayed=true`，结果与首次完全相同；
+- **冲突**：同一 `request_key` 携带不同内容（换目标、换时间、换原因）返回 `409`；
+- **不得重复生效**：令牌已被其它 `request_key` 撤销时返回 `409`；
+- 链不存在或令牌不在链中返回 `404`。
+
+```bash
+# 重放：相同内容 -> 200, replayed=true
+curl -s -X POST http://localhost:8000/api/v1/chains/demo-chain-0001/revocations \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id":"token-a","effective_at":"2026-07-01T00:00:00Z","reason":"service-a 密钥疑似泄露","request_key":"ops-2026-06-30-001"}'
+
+# 冲突：同一 request_key 换目标 -> 409
+curl -s -X POST http://localhost:8000/api/v1/chains/demo-chain-0001/revocations \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id":"token-b","effective_at":"2026-07-01T00:00:00Z","reason":"x","request_key":"ops-2026-06-30-001"}'
+```
 
 ### `POST /api/v1/chains/{chain_id}/evaluate`
 
@@ -179,6 +244,7 @@ PYTHONPATH=. python scripts/demo_chain.py submit
 
 | 检查名           | 失败 reason                | 含义                          |
 | ---------------- | -------------------------- | ----------------------------- |
+| `revocation`     | `revoked` / `ancestor_revoked` | 请求时间不早于撤销生效时间：本节点被撤销 / 祖先被撤销 |
 | `time_valid`     | `before_not_before` / `after_not_after` | 请求时间超出令牌有效期（边界含端点） |
 | `method_allowed` | `method_not_allowed`       | 方法不在令牌方法集合          |
 | `path_covered`   | `path_not_covered`         | 路径不匹配令牌 glob           |
@@ -186,6 +252,21 @@ PYTHONPATH=. python scripts/demo_chain.py submit
 
 求值必须**整条链所有节点**全部通过才为 `allow`；`first_failed_node` /
 `first_failed_reason` 指向按链顺序（根→叶，先完整性后请求级）遇到的第一个失败。
+
+撤销事件按**请求时间**解释：
+
+- 请求时间 `at` **不早于**某节点事件的 `effective_at`（含端点）时，该节点及其全部后代
+  一律拒绝，轨迹中 `first_failed_node` 标出链上最先受撤销影响的节点（被撤销节点本身
+  记 `revoked`，后代记 `ancestor_revoked`）；
+- 生效前的请求仍按原链判定，撤销事件不影响结果；
+- 链的撤销事件可通过 `GET /api/v1/chains/{chain_id}` 的 `revocations` 字段读取。
+
+```bash
+# 生效后求值 -> deny，first_failed_node 为被撤销节点
+curl -s -X POST http://localhost:8000/api/v1/chains/demo-chain-0001/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"request_path":"/files/reports/2026/q1.pdf","method":"GET","at":"2026-07-02T00:00:00Z","source_ip":"10.1.2.3"}'
+```
 
 ---
 
@@ -255,6 +336,8 @@ token["signature"] = compute_signature(token, issuer_secret)
 | `method_widens`           | 方法集合放大                               |
 | `time_window_widens`      | 时间窗放大                                 |
 | `ip_widens`               | IP 网段放大                                |
+| `revoked`                 | 请求时间不早于撤销生效时间，本节点已被撤销 |
+| `ancestor_revoked`        | 祖先令牌被撤销，本节点随之一并失效         |
 
 ---
 
@@ -274,14 +357,14 @@ token["signature"] = compute_signature(token, issuer_secret)
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：提交/重放/冲突/查询/求值
+│   ├── main.py        # FastAPI 路由：提交/重放/冲突/查询/求值/撤销
 │   ├── models.py      # Pydantic 模型与输入校验
 │   ├── security.py    # 规范化 JSON、HMAC、glob、收窄原语
 │   ├── engine.py      # 结构/签名/签发者/收窄/请求级验证引擎与轨迹
-│   ├── database.py    # SQLite 初始化、主体与链持久化
+│   ├── database.py    # SQLite 初始化、主体、链与撤销事件持久化
 │   └── config.py      # 环境变量配置
 ├── scripts/demo_chain.py
-├── tests/             # pytest：35 个用例（含端到端 API 与原语单测）
+├── tests/             # pytest：47 个用例（含端到端 API 与原语单测）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

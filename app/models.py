@@ -29,6 +29,8 @@ REASONS = {
     "method_not_allowed",
     "path_not_covered",
     "ip_not_allowed",
+    "revoked",
+    "ancestor_revoked",
 }
 
 _IPNetwork = IPv4Network | IPv6Network
@@ -208,12 +210,53 @@ class SubmissionResult(BaseModel):
     integrity: IntegrityReport
 
 
+class RevocationRequest(BaseModel):
+    """运维方提交的撤销请求：自 effective_at 起吊销指定令牌及其后代。"""
+
+    token_id: str = Field(min_length=1, description="被撤销的令牌 id")
+    effective_at: datetime = Field(description="撤销生效时间（含时区）")
+    reason: str = Field(min_length=1, description="撤销原因（审计自由文本）")
+    request_key: str = Field(min_length=1, description="幂等键：同一 chain 内唯一")
+
+    @field_validator("effective_at")
+    @classmethod
+    def _validate_effective_at(cls, v: datetime) -> datetime:
+        return _ensure_aware(v, "effective_at")
+
+
+class RevocationEvent(BaseModel):
+    """不可变撤销事件：一旦写入不得更改或删除。"""
+
+    chain_id: str
+    token_id: str
+    effective_at: datetime
+    reason: str
+    request_key: str
+    created_at: datetime
+
+
+class RevocationResult(BaseModel):
+    chain_id: str
+    replayed: bool
+    event: RevocationEvent
+    affected_token_ids: list[str]
+
+
+class RevocationConflictDetail(BaseModel):
+    detail: str
+    chain_id: str
+    request_key: str
+    existing_request_key: str | None = None
+    existing_token_id: str | None = None
+
+
 class ChainRecord(BaseModel):
     chain_id: str
     content_sha256: str
     created_at: datetime
     integrity: IntegrityReport
     tokens: list[CapabilityToken]
+    revocations: list[RevocationEvent] = Field(default_factory=list)
 
 
 class EvaluateResult(BaseModel):

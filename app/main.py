@@ -1,8 +1,9 @@
-"""FastAPI 应用：提交能力链、幂等重放、冲突检测与请求级判定。"""
+"""FastAPI 应用：提交能力链、幂等重放、冲突检测、请求级判定与撤销审计。"""
 from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
@@ -10,11 +11,16 @@ from fastapi.responses import JSONResponse
 from .database import (
     get_conn,
     get_db,
+    get_revocation,
     get_secret,
+    get_token_revocation,
     init_db,
+    load_affected_token_ids,
     load_chain_record,
+    load_revocations,
     load_submission,
     save_chain,
+    save_revocation,
     upsert_principal,
 )
 from .engine import evaluate_request, validate_chain
@@ -26,6 +32,10 @@ from .models import (
     EvaluateResult,
     PrincipalIn,
     PrincipalOut,
+    RevocationConflictDetail,
+    RevocationEvent,
+    RevocationRequest,
+    RevocationResult,
     SubmissionResult,
 )
 from .security import canonical_submission_hash
@@ -155,4 +165,126 @@ def evaluate_chain(
     submission = load_submission(conn, chain_id)
     if submission is None:
         raise HTTPException(status_code=404, detail=f"chain_id {chain_id!r} 不存在")
-    return evaluate_request(submission, payload, _secret_lookup(conn))
+    revocations = load_revocations(conn, chain_id)
+    return evaluate_request(submission, payload, _secret_lookup(conn), revocations)
+
+
+@app.post(
+    "/api/v1/chains/{chain_id}/revocations",
+    response_model=RevocationResult,
+    responses={409: {"model": RevocationConflictDetail}},
+    status_code=201,
+)
+def revoke_token(
+    chain_id: str,
+    payload: RevocationRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> JSONResponse:
+    """提交（或重放）一条按时间生效的撤销事件。
+
+    - 同一 request_key 且内容一致：幂等返回 200，``replayed=true``，结果与首次相同；
+    - 同一 request_key 但内容不同（换目标等）：返回 409 冲突；
+    - 令牌已被其它 request_key 撤销：返回 409（已撤销令牌不得重复生效）；
+    - 新 request_key：在同一事务中确认令牌存在并追加不可变事件，返回 201
+      以及按原链顺序（根→叶）列出的受影响令牌（被撤销节点及其后代）。
+    """
+    submission = load_submission(conn, chain_id)
+    if submission is None:
+        raise HTTPException(status_code=404, detail=f"chain_id {chain_id!r} 不存在")
+    if payload.token_id not in {t.token_id for t in submission.tokens}:
+        raise HTTPException(
+            status_code=404,
+            detail=f"令牌 {payload.token_id!r} 不存在于链 {chain_id!r}",
+        )
+
+    existing = get_revocation(conn, chain_id, payload.request_key)
+    if existing is not None:
+        same = (
+            existing.token_id == payload.token_id
+            and existing.effective_at == payload.effective_at
+            and existing.reason == payload.reason
+        )
+        if same:
+            result = RevocationResult(
+                chain_id=chain_id,
+                replayed=True,
+                event=existing,
+                affected_token_ids=load_affected_token_ids(
+                    conn, chain_id, payload.request_key
+                ),
+            )
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content=result.model_dump(mode="json"),
+            )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "detail": (
+                    f"request_key={payload.request_key!r} 已用于链 {chain_id!r} "
+                    "的另一条撤销事件；相同 request_key 不允许携带不同内容"
+                ),
+                "chain_id": chain_id,
+                "request_key": payload.request_key,
+                "existing_request_key": existing.request_key,
+                "existing_token_id": existing.token_id,
+            },
+        )
+
+    prior = get_token_revocation(conn, chain_id, payload.token_id)
+    if prior is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "detail": (
+                    f"令牌 {payload.token_id!r} 已被 request_key="
+                    f"{prior.request_key!r} 的撤销事件吊销；已撤销令牌不得重复生效"
+                ),
+                "chain_id": chain_id,
+                "request_key": payload.request_key,
+                "existing_request_key": prior.request_key,
+                "existing_token_id": prior.token_id,
+            },
+        )
+
+    affected = _affected_token_ids(conn, submission, payload.token_id)
+    event = RevocationEvent(
+        chain_id=chain_id,
+        token_id=payload.token_id,
+        effective_at=payload.effective_at,
+        reason=payload.reason,
+        request_key=payload.request_key,
+        created_at=datetime.now(timezone.utc),
+    )
+    try:
+        save_revocation(conn, event, affected)
+    except sqlite3.IntegrityError:
+        # 并发下同 request_key / 同 token 的重复插入
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "detail": "撤销事件与既有记录冲突",
+                "chain_id": chain_id,
+                "request_key": payload.request_key,
+                "existing_request_key": None,
+                "existing_token_id": None,
+            },
+        )
+    result = RevocationResult(
+        chain_id=chain_id, replayed=False, event=event, affected_token_ids=affected
+    )
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED,
+        content=result.model_dump(mode="json"),
+    )
+
+
+def _affected_token_ids(
+    conn: sqlite3.Connection, submission: ChainSubmission, token_id: str
+) -> list[str]:
+    """被撤销节点及其后代，按原链顺序（根→叶）。"""
+    _, order = validate_chain(submission, _secret_lookup(conn))
+    ids = [t.token_id for t in order]
+    if token_id in ids:
+        return ids[ids.index(token_id):]
+    return [token_id]

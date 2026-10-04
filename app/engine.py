@@ -13,6 +13,7 @@ from .models import (
     EvaluateResult,
     IntegrityReport,
     NodeTrace,
+    RevocationEvent,
 )
 from .security import (
     ip_in_network,
@@ -355,8 +356,13 @@ def evaluate_request(
     submission: ChainSubmission,
     request: EvaluateRequest,
     secret_lookup: SecretLookup,
+    revocations: list[RevocationEvent] | None = None,
 ) -> EvaluateResult:
-    """对已存能力链执行请求级判定（完整性检查会重新计算一遍）。"""
+    """对已存能力链执行请求级判定（完整性检查会重新计算一遍）。
+
+    撤销事件按请求时间解释：``request.at`` 不早于某节点事件的
+    ``effective_at`` 时，该节点及其后代一律拒绝；生效前的请求仍按原链判定。
+    """
     integrity, order = validate_chain(submission, secret_lookup)
     builders: dict[str, _TraceBuilder] = {
         n.token_id: _TraceBuilder(
@@ -371,8 +377,41 @@ def evaluate_request(
         builders[node.token_id].checks = list(node.checks)
 
     at = request.at
+    rev_by_token = {e.token_id: e for e in revocations or []}
+    active_revocation: RevocationEvent | None = None
     for t in order:
         b = builders[t.token_id]
+
+        # 撤销沿链向后代传播：链上最先生效的事件覆盖其整个子链
+        event = rev_by_token.get(t.token_id)
+        if event is not None and at >= event.effective_at and active_revocation is None:
+            active_revocation = event
+        if active_revocation is not None:
+            if active_revocation.token_id == t.token_id:
+                b.add(
+                    Check(
+                        name="revocation",
+                        passed=False,
+                        detail=(
+                            f"令牌自 {active_revocation.effective_at.isoformat()} "
+                            f"起被撤销（{active_revocation.reason}）"
+                        ),
+                        reason="revoked",
+                    )
+                )
+            else:
+                b.add(
+                    Check(
+                        name="revocation",
+                        passed=False,
+                        detail=(
+                            f"祖先令牌 {active_revocation.token_id} 自 "
+                            f"{active_revocation.effective_at.isoformat()} 起被撤销"
+                            f"（{active_revocation.reason}），本令牌随之一并失效"
+                        ),
+                        reason="ancestor_revoked",
+                    )
+                )
 
         if at < t.not_before:
             b.add(
